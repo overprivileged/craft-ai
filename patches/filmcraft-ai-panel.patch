@@ -1,0 +1,1688 @@
+diff --git a/crates/ui-egui/src/app.rs b/crates/ui-egui/src/app.rs
+index b573e6a..2a3ffc6 100644
+--- a/crates/ui-egui/src/app.rs
++++ b/crates/ui-egui/src/app.rs
+@@ -95,6 +95,7 @@ impl FilmcraftApp {
+             input_waiters: Vec::new(),
+             styled: false,
+             ui_error: None,
++            ai: Default::default(),
+             panic_next_frame: false,
+             quit_confirmed: false,
+             fonts_ready: false,
+diff --git a/crates/ui-egui/src/app/window.rs b/crates/ui-egui/src/app/window.rs
+index cd693e6..18e2469 100644
+--- a/crates/ui-egui/src/app/window.rs
++++ b/crates/ui-egui/src/app/window.rs
+@@ -42,6 +42,16 @@ impl FilmcraftApp {
+         if p == PanelKind::Timeline {
+             self.ui.dock.restore_timeline();
+         }
++        // the AI panel docks along the right edge of the workspace, beside whatever is there
++        if p == PanelKind::AiChat && !self.ui.dock.contains(&p) {
++            let anchor = [PanelKind::Program, PanelKind::Timeline, PanelKind::Project].into_iter().find(|k| self.ui.dock.is_docked(*k));
++            if let Some(anchor) = anchor {
++                let placement = craft_ui::docking::Placement::Edge(craft_ui::docking::Zone::Right);
++                if let Err(e) = self.apply_dock(craft_ui::docking::Action::OpenAt { panel: p, anchor, placement }) {
++                    log::warn!("could not dock the AI panel on the right: {e}");
++                }
++            }
++        }
+         if !self.ui.dock.contains(&p) {
+             let near = match p {
+                 // a side panel beside Properties (or Essential Sound), never over the Program monitor
+diff --git a/crates/ui-egui/src/dock.rs b/crates/ui-egui/src/dock.rs
+index b29726d..7ca8986 100644
+--- a/crates/ui-egui/src/dock.rs
++++ b/crates/ui-egui/src/dock.rs
+@@ -41,10 +41,12 @@ pub enum PanelKind {
+     ReferenceMonitor,
+     Timecode,
+     ProjectNotes,
++    /// Chat with a local AI agent (off by default, Window ▸ AI; docks on the right).
++    AiChat,
+ }
+ 
+ impl PanelKind {
+-    pub const ALL: [PanelKind; 28] = [
++    pub const ALL: [PanelKind; 29] = [
+         PanelKind::Project,
+         PanelKind::MediaBrowser,
+         PanelKind::Libraries,
+@@ -73,6 +75,7 @@ impl PanelKind {
+         PanelKind::ReferenceMonitor,
+         PanelKind::Timecode,
+         PanelKind::ProjectNotes,
++        PanelKind::AiChat,
+     ];
+     pub fn title(self) -> &'static str {
+         match self {
+@@ -104,6 +107,7 @@ impl PanelKind {
+             PanelKind::ReferenceMonitor => "Reference Monitor",
+             PanelKind::Timecode => "Timecode",
+             PanelKind::ProjectNotes => "Project Notes",
++            PanelKind::AiChat => "AI",
+         }
+     }
+     pub fn id(self) -> String {
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 6a03a83..1648033 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -328,6 +328,8 @@ pub struct FilmcraftApp {
+     styled: bool,
+     /// A panic in the UI pass, shown in an error window until dismissed (see [`crash`]).
+     pub ui_error: Option<String>,
++    /// The AI panel's connection and conversation (not saved).
++    pub ai: panels::ai_chat::AiState,
+     /// The window runs in a fallback graphics mode (set by the desktop host): a notice with a
+     /// button back to the default mode (see [`graphics_notice`]).
+     pub graphics_notice: Option<graphics_notice::GraphicsNotice>,
+diff --git a/crates/ui-egui/src/panels.rs b/crates/ui-egui/src/panels.rs
+index 9502b4b..0d42f49 100644
+--- a/crates/ui-egui/src/panels.rs
++++ b/crates/ui-egui/src/panels.rs
+@@ -1,6 +1,7 @@
+ //! Panel bodies. `show` dispatches on [`PanelKind`]; drag-and-drop between panels (project items,
+ //! effects) is carried in egui temp data so the timeline/monitors can accept drops.
+ 
++pub mod ai_chat;
+ pub mod audio_fx_editor;
+ pub mod caption_export;
+ pub mod clip_dialogs;
+@@ -167,6 +168,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect)
+         PanelKind::EssentialSound => essential_sound::show(app, ui, rect),
+         PanelKind::TextToSpeech => tts::show(app, ui, rect),
+         PanelKind::ProjectNotes => notes::show(app, ui, rect),
++        PanelKind::AiChat => ai_chat::show(app, ui, rect),
+         other => crate::dock::placeholder(ui, rect, &app.tokens, &tlf!("{panel} — coming in a later milestone", panel = crate::i18n::t(other.title()))),
+     }
+ }
+diff --git a/crates/ui-egui/src/panels/ai_chat.rs b/crates/ui-egui/src/panels/ai_chat.rs
+new file mode 100644
+index 0000000..4e8b87b
+--- /dev/null
++++ b/crates/ui-egui/src/panels/ai_chat.rs
+@@ -0,0 +1,1456 @@
++//! AI panel: chat with an AI agent that edits the project through the official MCP server.
++//!
++//! The panel is UI only. It holds no API keys and makes no internet calls: it talks to a local
++//! agent process over `127.0.0.1` (port `CRAFT_AI_PORT`, default 7600), one JSON object per line,
++//! versioned `{"v":1,…}`, and proves itself with the token in `CRAFT_AI_TOKEN` (the agent starts
++//! FilmCraft with it). Without the agent the panel says how to start it and stays quiet.
++//! Every line from the socket is untrusted: sizes are capped and unknown messages are skipped.
++//! Colours, fonts and spacing come from the app theme; only the Guard banner has its own amber.
++//!
++//! Automation ids: `ai.tab.chat`, `ai.tab.activity`, `ai.status`, `ai.folder`, `ai.model`,
++//! `ai.copyChat`, `ai.saveChat`, `ai.banner`, `ai.banner.dismiss`, `ai.msg.<i>`, `ai.msg.<i>.copy`,
++//! `ai.turn.<id>.steps`, `ai.card.<n>`, `ai.card.<n>.apply`, `ai.card.<n>.undo`, `ai.held.<code>`,
++//! `ai.held.<code>.allow`, `ai.held.<code>.allowChat`, `ai.held.<code>.deny`, `ai.working`,
++//! `ai.stop`, `ai.input`, `ai.send`, `ai.activity.text`, `ai.activity.copy`.
++
++use egui::{Color32, Rect, RichText, Stroke, vec2};
++use serde::Deserialize;
++use serde_json::{Value, json};
++
++use crate::FilmcraftApp;
++use crate::theme::Tokens;
++
++/// Protocol version this panel speaks.
++pub const PROTOCOL: u64 = 1;
++/// Default agent port on 127.0.0.1.
++pub const DEFAULT_PORT: u16 = 7600;
++/// Longest accepted line from the agent (bytes); longer ones drop the connection.
++pub const MAX_LINE: usize = 1 << 20;
++/// Longest kept text field (characters).
++const MAX_TEXT: usize = 20_000;
++/// Most chat entries kept; older ones scroll away.
++const MAX_ENTRIES: usize = 400;
++/// Most steps shown on one change card or turn.
++const MAX_STEPS: usize = 64;
++/// Most activity lines kept.
++const MAX_ACTIVITY: usize = 2_000;
++/// Prompts kept for ↑ recall.
++const MAX_PROMPTS: usize = 50;
++/// The Guard banner's own colours: a fixed amber so the warning reads the same in every theme.
++const BANNER_BG: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x3A);
++const BANNER_TEXT: Color32 = Color32::from_rgb(0x2A, 0x20, 0x00);
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum CardState {
++    Applied,
++    Undone,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum HeldState {
++    Pending,
++    Allowed,
++    AllowedChat,
++    Denied,
++}
++
++/// A message from the agent.
++#[derive(Clone, Debug, PartialEq, Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum Incoming {
++    Hello {
++        #[serde(default)]
++        app: String,
++        #[serde(default)]
++        folder: Option<String>,
++        #[serde(default)]
++        guard: String,
++        #[serde(default)]
++        model: String,
++        #[serde(default)]
++        models: Vec<String>,
++    },
++    User {
++        id: u64,
++        text: String,
++    },
++    AiDelta {
++        id: u64,
++        text: String,
++    },
++    AiDone {
++        id: u64,
++        #[serde(default)]
++        text: String,
++    },
++    Tool {
++        id: u64,
++        #[serde(default)]
++        summary: String,
++    },
++    Card {
++        n: u64,
++        title: String,
++        #[serde(default)]
++        steps: Vec<String>,
++        undo_count: u32,
++        state: CardState,
++    },
++    Banner {
++        text: String,
++        #[serde(default)]
++        preview: String,
++    },
++    Held {
++        code: String,
++        summary: String,
++        #[serde(default)]
++        reason: String,
++        state: HeldState,
++        #[serde(default)]
++        chat_allowable: bool,
++    },
++    Status {
++        busy: bool,
++        #[serde(default)]
++        text: String,
++    },
++    Activity {
++        #[serde(default)]
++        reset: bool,
++        lines: Vec<String>,
++    },
++    Note {
++        text: String,
++    },
++    /// What is selected in the app right now (clips, playhead, In/Out), as a short label.
++    Selection {
++        #[serde(default)]
++        text: String,
++        #[serde(default)]
++        count: u32,
++    },
++    Recipes {
++        items: Vec<RecipeItem>,
++    },
++    RecipePreview {
++        id: String,
++        name: String,
++        #[serde(default)]
++        description: String,
++        request: String,
++        #[serde(default)]
++        will: Vec<String>,
++        #[serde(default)]
++        files: String,
++        #[serde(default)]
++        exports: String,
++        #[serde(default)]
++        warnings: Vec<RecipeWarning>,
++        #[serde(default)]
++        ignored: Vec<String>,
++        #[serde(default)]
++        flagged: bool,
++    },
++    Error {
++        text: String,
++    },
++}
++
++/// A recipe in the Recipes menu (built-in, or a file in the project's `.craft-ai/recipes`).
++#[derive(Clone, Debug, PartialEq, Deserialize)]
++pub struct RecipeItem {
++    pub id: String,
++    pub name: String,
++    #[serde(default)]
++    pub description: String,
++    #[serde(default)]
++    pub params: std::collections::BTreeMap<String, Value>,
++    #[serde(default)]
++    pub builtin: bool,
++    #[serde(default)]
++    pub support: String,
++}
++
++/// Text in a recipe that the Guard flagged as talking to an AI.
++#[derive(Clone, Debug, PartialEq, Deserialize)]
++pub struct RecipeWarning {
++    pub field: String,
++    pub text: String,
++}
++
++/// Recipe ids go into automation ids and back to the agent: `builtin:` / `file:` + a slug.
++fn recipe_id_ok(id: &str) -> bool {
++    !id.is_empty() && id.len() <= 80 && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == ':')
++}
++
++fn param_value(v: &Value) -> String {
++    match v {
++        Value::String(s) => s.chars().take(200).collect(),
++        Value::Number(n) => n.to_string(),
++        _ => String::new(),
++    }
++}
++
++fn clip(s: &mut String) {
++    if s.chars().count() > MAX_TEXT {
++        *s = s.chars().take(MAX_TEXT).collect::<String>() + "…";
++    }
++}
++
++/// Parse and sanitise one line from the agent. Never panics; every field is size-capped.
++pub fn parse_line(line: &str) -> Result<Incoming, String> {
++    if line.len() > MAX_LINE {
++        return Err("line too long".into());
++    }
++    let v: Value = serde_json::from_str(line.trim()).map_err(|e| format!("not JSON: {e}"))?;
++    match v.get("v").and_then(Value::as_u64) {
++        Some(PROTOCOL) => {}
++        Some(other) => return Err(format!("protocol v{other}, this panel speaks v{PROTOCOL}")),
++        None => return Err("missing protocol version".into()),
++    }
++    let mut m: Incoming = serde_json::from_value(v).map_err(|e| format!("unknown message: {e}"))?;
++    match &mut m {
++        Incoming::Hello { app, folder, guard, model, models } => {
++            clip(app);
++            clip(guard);
++            clip(model);
++            if let Some(f) = folder {
++                clip(f);
++            }
++            models.truncate(16);
++            models.iter_mut().for_each(clip);
++        }
++        Incoming::User { text, .. } | Incoming::AiDelta { text, .. } | Incoming::AiDone { text, .. } | Incoming::Error { text } | Incoming::Note { text } => {
++            clip(text)
++        }
++        Incoming::Tool { summary, .. } => clip(summary),
++        Incoming::Card { title, steps, .. } => {
++            clip(title);
++            steps.truncate(MAX_STEPS);
++            steps.iter_mut().for_each(clip);
++        }
++        Incoming::Banner { text, preview } => {
++            clip(text);
++            clip(preview);
++        }
++        Incoming::Held { code, summary, reason, .. } => {
++            // codes go into automation ids and back to the agent: hex only
++            if code.is_empty() || code.len() > 16 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
++                return Err("bad held-call code".into());
++            }
++            clip(summary);
++            clip(reason);
++        }
++        Incoming::Status { text, .. } => clip(text),
++        Incoming::Selection { text, .. } => {
++            if text.chars().count() > 200 {
++                *text = text.chars().take(200).collect::<String>() + "…";
++            }
++        }
++        Incoming::Recipes { items } => {
++            items.retain(|r| recipe_id_ok(&r.id));
++            items.truncate(100);
++            for r in items.iter_mut() {
++                clip(&mut r.name);
++                clip(&mut r.description);
++                clip(&mut r.support);
++                while r.params.len() > 16 {
++                    r.params.pop_last();
++                }
++            }
++        }
++        Incoming::RecipePreview { id, name, description, request, will, files, exports, warnings, ignored, .. } => {
++            if !recipe_id_ok(id) {
++                return Err("bad recipe id".into());
++            }
++            for s in [name, description, request, files, exports] {
++                clip(s);
++            }
++            will.truncate(16);
++            will.iter_mut().for_each(clip);
++            warnings.truncate(16);
++            for w in warnings.iter_mut() {
++                clip(&mut w.field);
++                clip(&mut w.text);
++            }
++            ignored.truncate(16);
++            ignored.iter_mut().for_each(clip);
++        }
++        Incoming::Activity { lines, .. } => {
++            let extra = lines.len().saturating_sub(MAX_ACTIVITY);
++            lines.drain(..extra);
++            for l in lines.iter_mut() {
++                if l.chars().count() > 2_000 {
++                    *l = l.chars().take(2_000).collect::<String>() + "…";
++                }
++            }
++        }
++    }
++    Ok(m)
++}
++
++/// Split complete lines off the front of `buf` (bytes after the last newline stay for later).
++pub fn take_lines(buf: &mut Vec<u8>) -> Vec<String> {
++    let mut out = Vec::new();
++    while let Some(i) = buf.iter().position(|b| *b == b'\n') {
++        let line: Vec<u8> = buf.drain(..=i).collect();
++        out.push(String::from_utf8_lossy(&line).trim_end().to_string());
++    }
++    out
++}
++
++#[derive(Clone, Debug)]
++enum Entry {
++    User(String),
++    /// One AI turn: the tools it used (collapsed) and its reply.
++    Turn {
++        id: u64,
++        tools: Vec<String>,
++        text: String,
++        done: bool,
++    },
++    Card {
++        n: u64,
++        title: String,
++        steps: Vec<String>,
++        undo_count: u32,
++        state: CardState,
++    },
++    Held {
++        code: String,
++        summary: String,
++        reason: String,
++        state: HeldState,
++        chat_allowable: bool,
++    },
++    Note(String),
++}
++
++/// The conversation as Markdown, for "Copy chat".
++fn transcript(entries: &[Entry]) -> String {
++    let mut out = String::new();
++    for e in entries {
++        match e {
++            Entry::User(t) => out.push_str(&format!("**You:** {t}\n\n")),
++            Entry::Turn { text, tools, .. } => {
++                if !tools.is_empty() {
++                    let n = if tools.len() == 1 { "1 step".to_string() } else { format!("{} steps", tools.len()) };
++                    out.push_str(&format!("_Worked · {n}: {}_\n\n", tools.join(", ")));
++                }
++                if !text.is_empty() {
++                    out.push_str(&format!("**AI:** {text}\n\n"));
++                }
++            }
++            Entry::Card { n, title, undo_count, state, .. } => {
++                let steps = if *undo_count == 1 { "1 undo step".to_string() } else { format!("{undo_count} undo steps") };
++                out.push_str(&format!("> Change {n}: {title} ({steps}, {state:?})\n\n"));
++            }
++            Entry::Held { summary, state, .. } => out.push_str(&format!("> Held: {summary} ({state:?})\n\n")),
++            Entry::Note(t) => out.push_str(&format!("> {t}\n\n")),
++        }
++    }
++    out
++}
++
++enum LinkEvent {
++    Connected,
++    Message(Incoming),
++    Skipped(String),
++    Disconnected(String),
++}
++
++struct Link {
++    out: std::sync::mpsc::Sender<String>,
++    events: std::sync::mpsc::Receiver<LinkEvent>,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++enum Tab {
++    #[default]
++    Chat,
++    Activity,
++}
++
++/// The panel's state (not saved: the conversation lives in the agent).
++#[derive(Default)]
++pub struct AiState {
++    link: Option<Link>,
++    started: bool,
++    no_token: bool,
++    connected: bool,
++    last_problem: Option<String>,
++    entries: Vec<Entry>,
++    input: String,
++    prompts: Vec<String>,
++    folder: Option<String>,
++    guard: String,
++    model: String,
++    models: Vec<String>,
++    busy: Option<String>,
++    busy_since: Option<f64>,
++    banner: Option<(String, String)>,
++    error: Option<String>,
++    tab: Tab,
++    activity: Vec<String>,
++    recipes: Vec<RecipeItem>,
++    recipes_open: bool,
++    recipe_sel: Option<String>,
++    recipe_vals: Vec<(String, String)>,
++    preview: Option<Incoming>,
++    /// The app selection as the agent last reported it, and whether requests should NOT carry it.
++    selection: String,
++    selection_off: bool,
++    /// Set by "Ask AI…" in a context menu: focus the input on the next frame.
++    focus_input: bool,
++}
++
++impl AiState {
++    fn send(&mut self, msg: Value) {
++        let Some(link) = &self.link else { return };
++        if let Ok(line) = serde_json::to_string(&msg) {
++            let _ = link.out.send(line);
++        }
++    }
++
++    fn push(&mut self, e: Entry) {
++        self.entries.push(e);
++        if self.entries.len() > MAX_ENTRIES {
++            let extra = self.entries.len() - MAX_ENTRIES;
++            self.entries.drain(..extra);
++        }
++    }
++
++    /// The turn with this id (created at the end if it isn't there yet).
++    fn turn(&mut self, id: u64) -> Option<&mut Entry> {
++        if !self.entries.iter().any(|e| matches!(e, Entry::Turn { id: i, .. } if *i == id)) {
++            self.push(Entry::Turn { id, tools: Vec::new(), text: String::new(), done: false });
++        }
++        self.entries.iter_mut().rev().find(|e| matches!(e, Entry::Turn { id: i, .. } if *i == id))
++    }
++
++    fn apply(&mut self, m: Incoming, now: f64) {
++        match m {
++            Incoming::Hello { folder, guard, model, models, .. } => {
++                self.folder = folder;
++                self.guard = guard;
++                self.model = model;
++                self.models = models;
++            }
++            Incoming::User { text, .. } => self.push(Entry::User(text)),
++            Incoming::AiDelta { id, text } => {
++                if let Some(Entry::Turn { text: t, .. }) = self.turn(id) {
++                    t.push_str(&text);
++                    clip(t);
++                }
++            }
++            Incoming::AiDone { id, text } => {
++                if let Some(Entry::Turn { text: t, done, .. }) = self.turn(id) {
++                    if !text.is_empty() {
++                        *t = text;
++                    }
++                    *done = true;
++                }
++            }
++            Incoming::Tool { id, summary } => {
++                if let Some(Entry::Turn { tools, .. }) = self.turn(id)
++                    && tools.len() < MAX_STEPS
++                {
++                    tools.push(summary);
++                }
++            }
++            Incoming::Card { n, title, steps, undo_count, state } => {
++                let card = Entry::Card { n, title, steps, undo_count, state };
++                match self.entries.iter_mut().find(|e| matches!(e, Entry::Card { n: k, .. } if *k == n)) {
++                    Some(slot) => *slot = card,
++                    None => self.push(card),
++                }
++            }
++            Incoming::Banner { text, preview } => self.banner = Some((text, preview)),
++            Incoming::Held { code, summary, reason, state, chat_allowable } => {
++                let held = Entry::Held { code: code.clone(), summary, reason, state, chat_allowable };
++                match self.entries.iter_mut().find(|e| matches!(e, Entry::Held { code: c, .. } if *c == code)) {
++                    Some(slot) => *slot = held,
++                    None => self.push(held),
++                }
++            }
++            Incoming::Status { busy, text } => {
++                if busy && self.busy.is_none() {
++                    self.busy_since = Some(now);
++                }
++                if !busy {
++                    self.busy_since = None;
++                    // a turn that ended without a final message is done anyway
++                    for e in self.entries.iter_mut() {
++                        if let Entry::Turn { done, .. } = e {
++                            *done = true;
++                        }
++                    }
++                }
++                self.busy = busy.then_some(text);
++            }
++            Incoming::Activity { reset, lines } => {
++                if reset {
++                    self.activity.clear();
++                }
++                self.activity.extend(lines);
++                let extra = self.activity.len().saturating_sub(MAX_ACTIVITY);
++                self.activity.drain(..extra);
++            }
++            Incoming::Note { text } => self.push(Entry::Note(text)),
++            Incoming::Selection { text, .. } => self.selection = text,
++            Incoming::Recipes { items } => self.recipes = items,
++            p @ Incoming::RecipePreview { .. } => self.preview = Some(p),
++            Incoming::Error { text } => self.error = Some(text),
++        }
++    }
++
++    /// Start the background connection once (desktop only).
++    fn ensure_started(&mut self, ctx: &egui::Context) {
++        if self.started {
++            return;
++        }
++        self.started = true;
++        let token = std::env::var("CRAFT_AI_TOKEN").unwrap_or_default();
++        if token.trim().is_empty() {
++            self.no_token = true;
++            return;
++        }
++        let port = std::env::var("CRAFT_AI_PORT").ok().and_then(|p| p.trim().parse::<u16>().ok()).unwrap_or(DEFAULT_PORT);
++        self.link = spawn_link(ctx.clone(), token, port);
++    }
++
++    fn poll(&mut self, now: f64) {
++        let mut events = Vec::new();
++        if let Some(link) = &self.link {
++            while let Ok(e) = link.events.try_recv() {
++                events.push(e);
++                if events.len() > 2000 {
++                    break; // the rest next frame
++                }
++            }
++        }
++        for e in events {
++            match e {
++                LinkEvent::Connected => {
++                    self.connected = true;
++                    self.last_problem = None;
++                }
++                LinkEvent::Message(m) => self.apply(m, now),
++                LinkEvent::Skipped(why) => log::warn!("AI panel: skipped a message from the agent: {why}"),
++                LinkEvent::Disconnected(why) => {
++                    self.connected = false;
++                    self.busy = None;
++                    self.busy_since = None;
++                    self.last_problem = Some(why);
++                }
++            }
++        }
++    }
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++fn spawn_link(ctx: egui::Context, token: String, port: u16) -> Option<Link> {
++    use std::io::{ErrorKind, Read, Write};
++    use std::net::{SocketAddr, TcpStream};
++    use std::sync::mpsc::{TryRecvError, channel};
++    use std::time::Duration;
++
++    let (out_tx, out_rx) = channel::<String>();
++    let (ev_tx, ev_rx) = channel::<LinkEvent>();
++    let addr = SocketAddr::from(([127, 0, 0, 1], port));
++    let spawned = std::thread::Builder::new().name("ai-panel-link".into()).spawn(move || {
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            'reconnect: loop {
++                let mut s = match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
++                    Ok(s) => s,
++                    Err(e) => {
++                        if ev_tx.send(LinkEvent::Disconnected(e.to_string())).is_err() {
++                            return;
++                        }
++                        ctx.request_repaint();
++                        std::thread::sleep(Duration::from_secs(2));
++                        // drop what was typed while offline: the agent never saw it
++                        while out_rx.try_recv().is_ok() {}
++                        continue;
++                    }
++                };
++                let hello = json!({"v": PROTOCOL, "type": "hello", "token": token, "client": "filmcraft-ai-panel"}).to_string() + "\n";
++                if s.set_read_timeout(Some(Duration::from_millis(50))).is_err() || s.write_all(hello.as_bytes()).is_err() {
++                    std::thread::sleep(Duration::from_secs(2));
++                    continue;
++                }
++                if ev_tx.send(LinkEvent::Connected).is_err() {
++                    return;
++                }
++                ctx.request_repaint();
++                let mut buf: Vec<u8> = Vec::new();
++                let mut chunk = [0u8; 16 * 1024];
++                loop {
++                    match out_rx.try_recv() {
++                        Ok(line) => {
++                            if s.write_all(line.as_bytes()).and_then(|_| s.write_all(b"\n")).is_err() {
++                                let _ = ev_tx.send(LinkEvent::Disconnected("write failed".into()));
++                                continue 'reconnect;
++                            }
++                            continue;
++                        }
++                        Err(TryRecvError::Disconnected) => return, // the panel is gone
++                        Err(TryRecvError::Empty) => {}
++                    }
++                    match s.read(&mut chunk) {
++                        Ok(0) => {
++                            let _ = ev_tx.send(LinkEvent::Disconnected("the agent closed the connection".into()));
++                            ctx.request_repaint();
++                            std::thread::sleep(Duration::from_secs(1));
++                            continue 'reconnect;
++                        }
++                        Ok(n) => {
++                            buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
++                            if buf.len() > MAX_LINE && !buf.contains(&b'\n') {
++                                let _ = ev_tx.send(LinkEvent::Disconnected("a message from the agent was too long".into()));
++                                continue 'reconnect;
++                            }
++                            let mut any = false;
++                            for line in take_lines(&mut buf) {
++                                if line.is_empty() {
++                                    continue;
++                                }
++                                let ev = match parse_line(&line) {
++                                    Ok(m) => LinkEvent::Message(m),
++                                    Err(e) => LinkEvent::Skipped(e),
++                                };
++                                if ev_tx.send(ev).is_err() {
++                                    return;
++                                }
++                                any = true;
++                            }
++                            if any {
++                                ctx.request_repaint();
++                            }
++                        }
++                        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
++                        Err(e) => {
++                            let _ = ev_tx.send(LinkEvent::Disconnected(e.to_string()));
++                            ctx.request_repaint();
++                            std::thread::sleep(Duration::from_secs(1));
++                            continue 'reconnect;
++                        }
++                    }
++                }
++            }
++        }));
++        if result.is_err() {
++            log::error!("AI panel connection thread stopped after a panic");
++        }
++    });
++    match spawned {
++        Ok(_) => Some(Link { out: out_tx, events: ev_rx }),
++        Err(e) => {
++            log::error!("AI panel: could not start its connection thread: {e}");
++            None
++        }
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++fn spawn_link(_ctx: egui::Context, _token: String, _port: u16) -> Option<Link> {
++    None
++}
++
++/// "Ask AI…" in a context menu: open the AI panel with the selection chip on and the input focused.
++pub fn ask_about_selection(app: &mut FilmcraftApp) {
++    app.ai.selection_off = false;
++    app.ai.focus_input = true;
++    app.ai.tab = Tab::Chat;
++    app.show_panel(crate::dock::PanelKind::AiChat);
++}
++
++pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
++    let t = app.tokens;
++    let now = ui.input(|i| i.time);
++    let size = ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(13.0);
++    let mut elems: Vec<(String, egui::Response, String)> = Vec::new();
++    let st = &mut app.ai;
++    st.ensure_started(ui.ctx());
++    st.poll(now);
++    if st.busy.is_some() {
++        // the elapsed-time counter ticks while the AI works
++        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
++    }
++
++    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 6.0))));
++    let ui = &mut child;
++
++    // ---- header ----
++    ui.label(RichText::new(tl!("Unofficial. Not made by the ArtCraft team.")).small().color(t.text_faint));
++    ui.horizontal(|ui| {
++        let folder = st.folder.clone().unwrap_or_else(|| tl!("no project folder").to_string());
++        let r = ui.label(RichText::new(format!("📁 {folder}")).color(t.text)).on_hover_text(tl!("The only folder the AI may read or write"));
++        elems.push(("ai.folder".into(), r, folder));
++        if !st.guard.is_empty() {
++            ui.label(RichText::new(tlf!("Guard {state}", state = st.guard.clone())).small().color(t.text_dim));
++        }
++    });
++    ui.horizontal(|ui| {
++        let models = if st.models.is_empty() { vec!["sonnet".to_string(), "opus".to_string(), "haiku".to_string()] } else { st.models.clone() };
++        let current = if st.model.is_empty() { models.first().cloned().unwrap_or_default() } else { st.model.clone() };
++        let mut picked = None;
++        let combo = craft_ui::ComboBox::from_id_salt("ai-model").selected_text(current.clone()).show_ui(ui, |ui| {
++            for m in &models {
++                if ui.selectable_label(*m == current, m.as_str()).clicked() {
++                    picked = Some(m.clone());
++                }
++            }
++        });
++        elems.push(("ai.model".into(), combo.response, current.clone()));
++        if let Some(m) = picked.filter(|m| *m != current) {
++            st.model = m.clone();
++            st.send(json!({"v": PROTOCOL, "type": "model", "model": m}));
++        }
++        let status = if st.no_token || !st.connected { tl!("Start craft-agent to chat").to_string() } else { tl!("Connected").to_string() };
++        let r = ui.label(RichText::new(status.clone()).small().color(t.text_dim));
++        elems.push(("ai.status".into(), r, status));
++    });
++    ui.horizontal(|ui| {
++        let chat = ui.selectable_label(st.tab == Tab::Chat, tl!("Chat"));
++        elems.push(("ai.tab.chat".into(), chat.clone(), "Chat".into()));
++        if chat.clicked() {
++            st.tab = Tab::Chat;
++        }
++        let act = ui.selectable_label(st.tab == Tab::Activity, tl!("Activity"));
++        elems.push(("ai.tab.activity".into(), act.clone(), "Activity".into()));
++        if act.clicked() {
++            st.tab = Tab::Activity;
++        }
++        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match st.tab {
++            Tab::Chat => {
++                let rec = ui.add_enabled(st.connected, egui::Button::new(tl!("Recipes")).small().selected(st.recipes_open));
++                if rec.clicked() {
++                    st.recipes_open = !st.recipes_open;
++                }
++                elems.push(("ai.recipes".into(), rec, "Recipes".into()));
++                let save = ui
++                    .add_enabled(st.connected, egui::Button::new(tl!("Save chat")).small())
++                    .on_hover_text(tl!("Save the chat as Markdown in the project folder"));
++                elems.push(("ai.saveChat".into(), save.clone(), "Save chat".into()));
++                if save.clicked() {
++                    st.send(json!({"v": PROTOCOL, "type": "save_chat"}));
++                }
++                let copy = ui.add(egui::Button::new(tl!("Copy chat")).small());
++                elems.push(("ai.copyChat".into(), copy.clone(), "Copy chat".into()));
++                if copy.clicked() {
++                    ui.ctx().copy_text(transcript(&st.entries));
++                }
++            }
++            Tab::Activity => {
++                let copy = ui.add(egui::Button::new(tl!("Copy")).small());
++                elems.push(("ai.activity.copy".into(), copy.clone(), "Copy".into()));
++                if copy.clicked() {
++                    ui.ctx().copy_text(st.activity.join("\n"));
++                }
++            }
++        });
++    });
++
++    // ---- Guard banner (its own amber, on both tabs) ----
++    if let Some((text, preview)) = st.banner.clone() {
++        let mut dismiss = false;
++        let frame = egui::Frame::new().fill(BANNER_BG).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
++            ui.set_width(ui.available_width());
++            ui.horizontal(|ui| {
++                ui.label(RichText::new(format!("⚠ {text}")).strong().color(BANNER_TEXT));
++                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                    let r = ui.add(egui::Button::new(RichText::new("✕").color(BANNER_TEXT)).frame(false)).on_hover_text(tl!("Dismiss"));
++                    dismiss = r.clicked();
++                    elems.push(("ai.banner.dismiss".into(), r, "Dismiss".into()));
++                });
++            });
++            if !preview.is_empty() {
++                ui.add(
++                    egui::Label::new(
++                        RichText::new(tlf!(
++                            "It says: “{preview}”. The Guard marked it as untrusted; the AI is told not to follow it.",
++                            preview = preview.clone()
++                        ))
++                        .small()
++                        .color(BANNER_TEXT),
++                    )
++                    .selectable(true)
++                    .wrap(),
++                );
++            }
++        });
++        elems.push(("ai.banner".into(), frame.response, text));
++        if dismiss {
++            st.banner = None;
++        }
++    }
++    if let Some(err) = st.error.clone() {
++        let r = ui
++            .add(egui::Label::new(RichText::new(err.clone()).small().color(t.text_dim)).sense(egui::Sense::click()).wrap())
++            .on_hover_text(tl!("Click to dismiss"));
++        if r.clicked() {
++            st.error = None;
++        }
++    }
++
++    match st.tab {
++        Tab::Chat => chat_tab(st, ui, &t, size, now, &mut elems),
++        Tab::Activity => activity_tab(st, ui, &t, &mut elems),
++    }
++
++    for (id, r, label) in elems {
++        app.auto.add_response(&id, &r, &label);
++    }
++}
++
++fn chat_tab(st: &mut AiState, ui: &mut egui::Ui, t: &Tokens, size: f32, now: f64, elems: &mut Vec<(String, egui::Response, String)>) {
++    if st.recipes_open {
++        recipes_pane(st, ui, t, size, elems);
++    }
++    let working_h = if st.busy.is_some() { 26.0 } else { 0.0 };
++    let input_h = if st.selection.is_empty() { 64.0 } else { 90.0 };
++    let list_h = (ui.available_height() - input_h - working_h - 10.0).max(40.0);
++    let mut actions: Vec<Value> = Vec::new();
++    let mut copy: Option<String> = None;
++    egui::ScrollArea::vertical().id_salt("ai-chat-scroll").max_height(list_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
++        ui.set_width(ui.available_width());
++        ui.spacing_mut().item_spacing.y = 6.0;
++        if st.entries.is_empty() {
++            let hint = if st.connected { tl!("Ask for an edit, e.g. “add a 3 second black clip”.") } else { tl!("Start craft-agent to chat") };
++            ui.label(RichText::new(hint).color(t.text_faint));
++        }
++        for (i, e) in st.entries.iter().enumerate() {
++            match e {
++                Entry::User(text) => {
++                    let r = egui::Frame::new()
++                        .fill(t.field_bg)
++                        .stroke(Stroke::new(1.0, t.field_border))
++                        .corner_radius(4.0)
++                        .inner_margin(egui::Margin::symmetric(8, 6))
++                        .show(ui, |ui| {
++                            ui.set_width(ui.available_width());
++                            ui.horizontal_top(|ui| {
++                                ui.label(RichText::new("›").color(t.text_dim));
++                                ui.add(egui::Label::new(RichText::new(text).color(t.text)).selectable(true).wrap());
++                            });
++                        });
++                    elems.push((format!("ai.msg.{i}"), r.response, text.chars().take(120).collect()));
++                    copy_button(ui, t, i, text, &mut copy, elems);
++                }
++                Entry::Turn { id, tools, text, done } => {
++                    if !tools.is_empty() {
++                        let head = if *done { tlf!("Worked · {n} steps", n = tools.len()) } else { tlf!("Working · {n} steps", n = tools.len()) };
++                        let c = egui::CollapsingHeader::new(RichText::new(head.clone()).small().color(t.text_dim))
++                            .id_salt(("ai-turn", *id))
++                            .default_open(false)
++                            .show(ui, |ui| {
++                                for s in tools {
++                                    ui.add(egui::Label::new(RichText::new(format!("· {s}")).small().monospace().color(t.text_faint)).selectable(true).wrap());
++                                }
++                            });
++                        elems.push((format!("ai.turn.{id}.steps"), c.header_response, head));
++                    }
++                    if !text.is_empty() {
++                        let shown = if *done { text.clone() } else { format!("{text}▍") };
++                        let r = ui.add(egui::Label::new(markdown_job(&shown, t.text, size)).selectable(true).wrap());
++                        elems.push((format!("ai.msg.{i}"), r, text.chars().take(120).collect()));
++                        if *done {
++                            copy_button(ui, t, i, text, &mut copy, elems);
++                        }
++                    }
++                }
++                Entry::Card { n, title, steps, undo_count, state } => {
++                    let r = egui::Frame::new().fill(t.panel_bg).stroke(Stroke::new(1.0, t.field_border)).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
++                        ui.set_width(ui.available_width());
++                        let mark = if *state == CardState::Applied { "✓" } else { "↶" };
++                        ui.add(egui::Label::new(RichText::new(format!("{mark} {title}")).font(Tokens::semibold(size)).color(t.text)).selectable(true).wrap());
++                        let steps_label = if steps.len() == 1 { tl!("1 step").to_string() } else { tlf!("{n} steps", n = steps.len()) };
++                        egui::CollapsingHeader::new(RichText::new(steps_label).small().color(t.text_dim))
++                            .id_salt(("ai-card-steps", *n))
++                            .default_open(false)
++                            .show(ui, |ui| {
++                                for s in steps {
++                                    ui.add(egui::Label::new(RichText::new(s).small().monospace().color(t.text_dim)).selectable(true).wrap());
++                                }
++                            });
++                        ui.horizontal(|ui| {
++                            let apply = ui.add_enabled(*state == CardState::Undone, egui::Button::new(tl!("Apply")));
++                            if apply.clicked() {
++                                actions.push(json!({"v": PROTOCOL, "type": "card_apply", "n": n}));
++                            }
++                            elems.push((format!("ai.card.{n}.apply"), apply, "Apply".into()));
++                            let undo = ui.add_enabled(*state == CardState::Applied && *undo_count > 0, egui::Button::new(tl!("Undo")));
++                            if undo.clicked() {
++                                actions.push(json!({"v": PROTOCOL, "type": "card_undo", "n": n}));
++                            }
++                            elems.push((format!("ai.card.{n}.undo"), undo, "Undo".into()));
++                            let undo_label = if *undo_count == 1 { tl!("1 undo step").to_string() } else { tlf!("{count} undo steps", count = undo_count) };
++                            ui.label(RichText::new(undo_label).small().color(t.text_faint));
++                            let save = ui
++                                .add(egui::Button::new(RichText::new(tl!("Save as recipe")).small()).frame(false))
++                                .on_hover_text(tl!("Save this request as a recipe in the project folder"));
++                            if save.clicked() {
++                                actions.push(json!({"v": PROTOCOL, "type": "save_recipe", "n": n}));
++                            }
++                            elems.push((format!("ai.card.{n}.saveRecipe"), save, "Save as recipe".into()));
++                        });
++                    });
++                    elems.push((format!("ai.card.{n}"), r.response, title.clone()));
++                }
++                Entry::Held { code, summary, reason, state, chat_allowable } => {
++                    let r = egui::Frame::new().fill(t.panel_bg).stroke(Stroke::new(1.5, t.accent)).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
++                        ui.set_width(ui.available_width());
++                        ui.label(RichText::new(tl!("The AI wants to:")).small().color(t.text_dim));
++                        ui.add(egui::Label::new(RichText::new(summary).color(t.text)).selectable(true).wrap());
++                        if !reason.is_empty() {
++                            ui.add(egui::Label::new(RichText::new(reason).small().color(t.text_faint)).wrap());
++                        }
++                        match state {
++                            HeldState::Pending => {
++                                ui.horizontal_wrapped(|ui| {
++                                    let once = ui.button(tl!("Allow once"));
++                                    if once.clicked() {
++                                        actions.push(json!({"v": PROTOCOL, "type": "held_allow", "code": code, "scope": "once"}));
++                                    }
++                                    elems.push((format!("ai.held.{code}.allow"), once, "Allow once".into()));
++                                    if *chat_allowable {
++                                        let chat = ui
++                                            .button(tl!("Allow for this chat"))
++                                            .on_hover_text(tl!("Run this kind of action without asking until the chat ends"));
++                                        if chat.clicked() {
++                                            actions.push(json!({"v": PROTOCOL, "type": "held_allow", "code": code, "scope": "chat"}));
++                                        }
++                                        elems.push((format!("ai.held.{code}.allowChat"), chat, "Allow for this chat".into()));
++                                    }
++                                    let deny = ui.button(tl!("Deny"));
++                                    if deny.clicked() {
++                                        actions.push(json!({"v": PROTOCOL, "type": "held_deny", "code": code}));
++                                    }
++                                    elems.push((format!("ai.held.{code}.deny"), deny, "Deny".into()));
++                                });
++                            }
++                            HeldState::Allowed => {
++                                ui.label(RichText::new(tl!("Allowed once")).small().color(t.text_dim));
++                            }
++                            HeldState::AllowedChat => {
++                                ui.label(RichText::new(tl!("Allowed for this chat")).small().color(t.text_dim));
++                            }
++                            HeldState::Denied => {
++                                ui.label(RichText::new(tl!("Denied")).small().color(t.text_dim));
++                            }
++                        }
++                    });
++                    elems.push((format!("ai.held.{code}"), r.response, summary.clone()));
++                }
++                Entry::Note(text) => {
++                    ui.add(egui::Label::new(RichText::new(text).small().color(t.text_dim)).selectable(true).wrap());
++                }
++            }
++        }
++    });
++    if let Some(text) = copy {
++        ui.ctx().copy_text(text);
++    }
++    for a in actions {
++        st.send(a);
++    }
++
++    // ---- working indicator ----
++    if let Some(busy) = st.busy.clone() {
++        let secs = st.busy_since.map(|s| (now - s).max(0.0) as u64).unwrap_or(0);
++        ui.horizontal(|ui| {
++            ui.add(egui::Spinner::new().size(12.0).color(t.text_dim));
++            let label = if busy.is_empty() { tlf!("Working… {secs}s", secs = secs) } else { format!("{busy} {secs}s") };
++            let r = ui.label(RichText::new(label.clone()).small().color(t.text_dim));
++            elems.push(("ai.working".into(), r, label));
++            let stop = ui.add(egui::Button::new(tl!("Stop")).small());
++            if stop.clicked() {
++                st.send(json!({"v": PROTOCOL, "type": "stop"}));
++            }
++            elems.push(("ai.stop".into(), stop, "Stop".into()));
++        });
++    }
++
++    // ---- selection chip: the request carries what is selected in the app ("fix THIS clip") ----
++    if st.connected && !st.selection.is_empty() {
++        let label = tlf!("Use selection: {what}", what = st.selection.clone());
++        let chip = ui
++            .add(egui::Button::new(RichText::new(label.clone()).small()).selected(!st.selection_off))
++            .on_hover_text(tl!("When on, the AI is told which clips are selected, where the playhead is and the In/Out range"));
++        if chip.clicked() {
++            st.selection_off = !st.selection_off;
++        }
++        elems.push(("ai.useSelection".into(), chip, label));
++    }
++
++    // ---- input: Enter sends, Shift+Enter is a new line, ↑ recalls the last prompt ----
++    let can_send = st.connected && st.busy.is_none();
++    let field = egui::Id::unique("ai-input-field");
++    if std::mem::take(&mut st.focus_input) {
++        ui.memory_mut(|m| m.request_focus(field));
++    }
++    let focused = ui.memory(|m| m.has_focus(field));
++    let mut send_now = false;
++    if focused {
++        let empty = st.input.is_empty();
++        let (enter, newline, up) = ui.input_mut(|i| {
++            // match Enter by hand: Shift (alone) = new line, no modifier = send; leave other chords alone
++            let (mut enter, mut newline) = (false, false);
++            i.events.retain(|e| match e {
++                egui::Event::Key { key: egui::Key::Enter, pressed, modifiers, .. } if !(modifiers.command || modifiers.ctrl || modifiers.alt) => {
++                    if *pressed {
++                        if modifiers.shift {
++                            newline = true;
++                        } else {
++                            enter = true;
++                        }
++                    }
++                    false
++                }
++                _ => true,
++            });
++            (enter, newline, empty && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
++        });
++        send_now = enter;
++        if newline {
++            insert_newline(ui.ctx(), field, &mut st.input);
++        }
++        if up && let Some(last) = st.prompts.last() {
++            st.input = last.clone();
++        }
++    }
++    ui.horizontal(|ui| {
++        let w = (ui.available_width() - 60.0).max(60.0);
++        let edit = ui.add(
++            egui::TextEdit::multiline(&mut st.input)
++                .id(field)
++                .desired_rows(2)
++                .desired_width(w)
++                .hint_text(tl!("Ask the AI to edit… (Enter sends, Shift+Enter new line)"))
++                .text_color(t.text),
++        );
++        elems.push(("ai.input".into(), edit.clone(), st.input.chars().take(200).collect()));
++        let send = ui.add_enabled(can_send, egui::Button::new(tl!("Send")));
++        if (send.clicked() || send_now) && can_send && !st.input.trim().is_empty() {
++            let text: String = st.input.trim().chars().take(MAX_TEXT).collect();
++            st.input.clear();
++            st.error = None;
++            if st.prompts.last() != Some(&text) {
++                st.prompts.push(text.clone());
++                let extra = st.prompts.len().saturating_sub(MAX_PROMPTS);
++                st.prompts.drain(..extra);
++            }
++            let use_selection = !st.selection_off && !st.selection.is_empty();
++            st.send(json!({"v": PROTOCOL, "type": "send", "text": text, "use_selection": use_selection}));
++            edit.request_focus();
++        }
++        elems.push(("ai.send".into(), send, "Send".into()));
++    });
++}
++
++/// Shift+Enter: a new line at the cursor (the field itself would treat Enter as Send).
++fn insert_newline(ctx: &egui::Context, id: egui::Id, text: &mut String) {
++    use egui::text::{CCursor, CCursorRange};
++    let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
++    let chars = text.chars().count();
++    let at = state.cursor.char_range().map(|r| r.primary.index.0).unwrap_or(chars).min(chars);
++    let byte = text.char_indices().nth(at).map(|(b, _)| b).unwrap_or(text.len());
++    text.insert(byte, '\n');
++    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(at + 1))));
++    state.store(ctx, id);
++}
++
++fn recipes_pane(st: &mut AiState, ui: &mut egui::Ui, t: &Tokens, size: f32, elems: &mut Vec<(String, egui::Response, String)>) {
++    let mut send: Option<Value> = None;
++    let frame = egui::Frame::new().fill(t.panel_bg).stroke(Stroke::new(1.0, t.field_border)).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
++        ui.set_width(ui.available_width());
++        egui::ScrollArea::vertical().id_salt("ai-recipes-scroll").max_height(ui.available_height() * 0.6).show(ui, |ui| {
++            if st.recipes.is_empty() {
++                ui.label(RichText::new(tl!("No recipes yet.")).small().color(t.text_faint));
++            }
++            for r in st.recipes.clone() {
++                let picked = st.recipe_sel.as_deref() == Some(r.id.as_str());
++                let row = ui.selectable_label(picked, RichText::new(&r.name).font(Tokens::semibold(size)).color(t.text));
++                if row.clicked() {
++                    st.recipe_sel = Some(r.id.clone());
++                    st.recipe_vals = r.params.iter().map(|(k, v)| (k.clone(), param_value(v))).collect();
++                    st.preview = None;
++                }
++                elems.push((format!("ai.recipe.{}", r.id.replace(':', ".")), row, r.name.clone()));
++                if !r.description.is_empty() {
++                    ui.add(egui::Label::new(RichText::new(&r.description).small().color(t.text_dim)).wrap());
++                }
++                if !r.support.is_empty() {
++                    ui.add(egui::Label::new(RichText::new(&r.support).small().color(t.text_faint)).wrap());
++                }
++                if picked {
++                    for (k, v) in st.recipe_vals.iter_mut() {
++                        ui.horizontal(|ui| {
++                            ui.label(RichText::new(k.as_str()).small().color(t.text_dim));
++                            let e = ui.add(egui::TextEdit::singleline(v).desired_width(ui.available_width()).text_color(t.text));
++                            elems.push((format!("ai.recipe.param.{k}"), e, v.clone()));
++                        });
++                    }
++                    let b = ui.button(tl!("Preview"));
++                    if b.clicked() {
++                        send = Some(json!({"v": PROTOCOL, "type": "recipe_preview", "id": r.id, "values": vals_json(&st.recipe_vals)}));
++                    }
++                    elems.push(("ai.recipe.preview".into(), b, "Preview".into()));
++                }
++                ui.add_space(4.0);
++            }
++        });
++        if let Some(Incoming::RecipePreview { id, name, will, files, exports, warnings, ignored, flagged, .. }) = st.preview.clone()
++            && st.recipe_sel.as_deref() == Some(id.as_str())
++        {
++            ui.separator();
++            let head = ui.label(RichText::new(tlf!("This recipe will: ({name})", name = name)).font(Tokens::semibold(size)).color(t.text));
++            elems.push(("ai.recipe.previewCard".into(), head, name.clone()));
++            for w in &will {
++                ui.add(egui::Label::new(RichText::new(format!("• {w}")).color(t.text)).selectable(true).wrap());
++            }
++            ui.add(egui::Label::new(RichText::new(tlf!("Touches files: {files}", files = files)).small().color(t.text_dim)).wrap());
++            ui.add(egui::Label::new(RichText::new(tlf!("Exports: {exports}", exports = exports)).small().color(t.text_dim)).wrap());
++            if !ignored.is_empty() {
++                let list = ignored.join(", ");
++                ui.add(
++                    egui::Label::new(
++                        RichText::new(tlf!("Ignored: {list} (recipes can't change the Guard, the fence or the allow rule)", list = list))
++                            .small()
++                            .color(t.text_dim),
++                    )
++                    .wrap(),
++                );
++            }
++            for w in &warnings {
++                ui.add(egui::Label::new(RichText::new(format!("⚠ {}: {}", w.field, w.text)).small().color(t.text)).selectable(true).wrap());
++            }
++            ui.horizontal(|ui| {
++                let label = if flagged { tl!("Run anyway") } else { tl!("Run") };
++                let run = ui.add_enabled(st.busy.is_none(), egui::Button::new(label));
++                if run.clicked() {
++                    send = Some(json!({"v": PROTOCOL, "type": "recipe_run", "id": id, "values": vals_json(&st.recipe_vals)}));
++                    st.preview = None;
++                    st.recipes_open = false;
++                }
++                elems.push(("ai.recipe.run".into(), run, label.to_string()));
++                let cancel = ui.button(tl!("Cancel"));
++                if cancel.clicked() {
++                    st.preview = None;
++                }
++                elems.push(("ai.recipe.cancel".into(), cancel, "Cancel".into()));
++            });
++        }
++    });
++    elems.push(("ai.recipes.pane".into(), frame.response, "Recipes".into()));
++    if let Some(m) = send {
++        st.send(m);
++    }
++}
++
++fn vals_json(vals: &[(String, String)]) -> Value {
++    Value::Object(vals.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect())
++}
++
++fn copy_button(ui: &mut egui::Ui, t: &Tokens, i: usize, text: &str, copy: &mut Option<String>, elems: &mut Vec<(String, egui::Response, String)>) {
++    let r = ui.add(egui::Button::new(RichText::new(tl!("Copy")).small().color(t.text_faint)).frame(false)).on_hover_text(tl!("Copy this message"));
++    if r.clicked() {
++        *copy = Some(text.to_string());
++    }
++    elems.push((format!("ai.msg.{i}.copy"), r, "Copy".into()));
++}
++
++fn activity_tab(st: &mut AiState, ui: &mut egui::Ui, t: &Tokens, elems: &mut Vec<(String, egui::Response, String)>) {
++    let text = if st.activity.is_empty() { tl!("No activity yet.").to_string() } else { st.activity.join("\n") };
++    egui::ScrollArea::vertical().id_salt("ai-activity-scroll").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
++        // read-only but selectable and copyable
++        let r = ui.add(
++            egui::TextEdit::multiline(&mut text.as_str())
++                .id_salt("ai-activity-text")
++                .font(egui::TextStyle::Monospace)
++                .text_color(t.text_dim)
++                .desired_width(f32::INFINITY),
++        );
++        elems.push(("ai.activity.text".into(), r, st.activity.last().cloned().unwrap_or_default()));
++    });
++}
++
++fn markdown_job(text: &str, color: Color32, size: f32) -> egui::text::LayoutJob {
++    use crate::theme::Tokens;
++    use egui::text::{LayoutJob, TextFormat};
++    let fmt = |font_id: egui::FontId| TextFormat { font_id, color, ..Default::default() };
++    let mut job = LayoutJob::default();
++    for (k, line) in markdown_lines(text).iter().enumerate() {
++        if k > 0 {
++            job.append("\n", 0.0, fmt(Tokens::ui(size)));
++        }
++        let mut lead = line.indent as f32 * 12.0;
++        if let Some(m) = &line.marker {
++            job.append(&format!("{m} "), lead, fmt(Tokens::ui(size)));
++            lead = 0.0;
++        }
++        for (s, style) in &line.spans {
++            let font = match style {
++                _ if line.heading => Tokens::semibold(size),
++                MdStyle::Bold => Tokens::semibold(size),
++                MdStyle::Code => Tokens::mono(size * 0.95),
++                MdStyle::Plain => Tokens::ui(size),
++            };
++            job.append(s, lead, fmt(font));
++            lead = 0.0;
++        }
++    }
++    job
++}
++
++/// Inline style of a Markdown span.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum MdStyle {
++    Plain,
++    Bold,
++    Code,
++}
++
++/// One line of basic Markdown: a list marker (`•` or `3.`), its nesting, heading or not, styled spans.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct MdLine {
++    pub marker: Option<String>,
++    pub indent: usize,
++    pub heading: bool,
++    pub spans: Vec<(String, MdStyle)>,
++}
++
++/// Parse the small Markdown subset the AI uses. Never panics; unclosed `**` or `` ` `` stay literal
++/// (a reply that is still streaming shows them until the closing marker arrives).
++pub fn markdown_lines(text: &str) -> Vec<MdLine> {
++    text.lines()
++        .map(|raw| {
++            let trimmed = raw.trim_start();
++            let indent = raw.len().saturating_sub(trimmed.len()).min(8) / 2;
++            let bullet = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("• "));
++            let heading = trimmed.strip_prefix("### ").or_else(|| trimmed.strip_prefix("## ")).or_else(|| trimmed.strip_prefix("# "));
++            let (marker, is_heading, body) = if let Some(rest) = bullet {
++                (Some("•".to_string()), false, rest)
++            } else if let Some((num, rest)) = ordered_item(trimmed) {
++                (Some(format!("{num}.")), false, rest)
++            } else if let Some(rest) = heading {
++                (None, true, rest)
++            } else {
++                (None, false, trimmed)
++            };
++            MdLine { marker, indent, heading: is_heading, spans: inline_spans(body) }
++        })
++        .collect()
++}
++
++fn ordered_item(s: &str) -> Option<(u32, &str)> {
++    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
++    if digits == 0 || digits > 3 {
++        return None;
++    }
++    let num = s.get(..digits)?.parse().ok()?;
++    let rest = s.get(digits..)?;
++    let rest = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") "))?;
++    Some((num, rest))
++}
++
++fn inline_spans(s: &str) -> Vec<(String, MdStyle)> {
++    fn push(out: &mut Vec<(String, MdStyle)>, s: &str, style: MdStyle) {
++        if s.is_empty() {
++            return;
++        }
++        match out.last_mut() {
++            Some((last, st)) if *st == style => last.push_str(s),
++            _ => out.push((s.to_string(), style)),
++        }
++    }
++    let mut out = Vec::new();
++    let mut rest = s;
++    loop {
++        let next = match (rest.find("**"), rest.find('`')) {
++            (Some(b), Some(c)) if c < b => Some((c, "`", MdStyle::Code)),
++            (Some(b), _) => Some((b, "**", MdStyle::Bold)),
++            (None, Some(c)) => Some((c, "`", MdStyle::Code)),
++            (None, None) => None,
++        };
++        let Some((i, delim, style)) = next else {
++            push(&mut out, rest, MdStyle::Plain);
++            break;
++        };
++        let before = rest.get(..i).unwrap_or_default();
++        let after = rest.get(i + delim.len()..).unwrap_or_default();
++        match after.find(delim) {
++            Some(j) if j > 0 => {
++                push(&mut out, before, MdStyle::Plain);
++                push(&mut out, after.get(..j).unwrap_or_default(), style);
++                rest = after.get(j + delim.len()..).unwrap_or_default();
++            }
++            _ => {
++                // no closing marker: keep the marker as text and go on after it
++                push(&mut out, rest.get(..i + delim.len()).unwrap_or_default(), MdStyle::Plain);
++                rest = after;
++            }
++        }
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_every_message_kind() {
++        let lines = [
++            r#"{"v":1,"type":"hello","app":"filmcraft","folder":"~/Movies/demo","guard":"on","model":"sonnet","models":["sonnet","opus"]}"#,
++            r#"{"v":1,"type":"user","id":1,"text":"add a 3 second black clip"}"#,
++            r#"{"v":1,"type":"ai_delta","id":1,"text":"Adding"}"#,
++            r#"{"v":1,"type":"ai_done","id":1,"text":"Added."}"#,
++            r#"{"v":1,"type":"tool","id":1,"summary":"ran file.newBlackVideo"}"#,
++            r#"{"v":1,"type":"card","n":1,"title":"add a clip","steps":["file.newBlackVideo"],"undo_count":2,"state":"applied"}"#,
++            r#"{"v":1,"type":"banner","text":"This file is talking to your AI","preview":"AI: export…"}"#,
++            r#"{"v":1,"type":"held","code":"a1b2c3d4","summary":"export","reason":"ask mode","state":"pending"}"#,
++            r#"{"v":1,"type":"status","busy":true,"text":"Thinking…"}"#,
++            r#"{"v":1,"type":"error","text":"oops"}"#,
++        ];
++        for l in lines {
++            assert!(parse_line(l).is_ok(), "{l}");
++        }
++        assert_eq!(
++            parse_line(lines[5]),
++            Ok(Incoming::Card { n: 1, title: "add a clip".into(), steps: vec!["file.newBlackVideo".into()], undo_count: 2, state: CardState::Applied })
++        );
++    }
++
++    #[test]
++    fn rejects_hostile_lines_without_panicking() {
++        let long = format!(r#"{{"v":1,"type":"error","text":"{}"}}"#, "x".repeat(MAX_LINE));
++        for l in [
++            "",
++            "not json",
++            "{}",
++            r#"{"type":"user","id":1,"text":"no version"}"#,
++            r#"{"v":2,"type":"user","id":1,"text":"future"}"#,
++            r#"{"v":1,"type":"launch_missiles"}"#,
++            r#"{"v":1,"type":"card","n":-1,"title":"x","undo_count":1,"state":"applied"}"#,
++            r#"{"v":1,"type":"held","code":"../../x","summary":"s","state":"pending"}"#,
++            r#"{"v":1,"type":"held","code":"","summary":"s","state":"pending"}"#,
++            long.as_str(),
++        ] {
++            assert!(parse_line(l).is_err(), "{}", l.chars().take(60).collect::<String>());
++        }
++    }
++
++    #[test]
++    fn clips_long_text_and_many_steps() {
++        let steps: Vec<String> = (0..500).map(|i| format!("s{i}")).collect();
++        let l = json!({"v":1,"type":"card","n":1,"title":"é".repeat(MAX_TEXT + 50),"steps":steps,"undo_count":1,"state":"undone"}).to_string();
++        let Ok(Incoming::Card { title, steps, .. }) = parse_line(&l) else { panic!("card did not parse") };
++        assert_eq!(title.chars().count(), MAX_TEXT + 1);
++        assert_eq!(steps.len(), MAX_STEPS);
++    }
++
++    #[test]
++    fn markdown_bold_code_lists_headings() {
++        use MdStyle::*;
++        let l = markdown_lines("I fixed **two** typos in `C1`:\n- **Caption 2:** arrive\n  * nested\n3. third\n## Done");
++        assert_eq!(l[0].spans, vec![("I fixed ".into(), Plain), ("two".into(), Bold), (" typos in ".into(), Plain), ("C1".into(), Code), (":".into(), Plain)]);
++        assert_eq!((l[1].marker.as_deref(), l[1].indent), (Some("•"), 0));
++        assert_eq!(l[1].spans, vec![("Caption 2:".into(), Bold), (" arrive".into(), Plain)]);
++        assert_eq!((l[2].marker.as_deref(), l[2].indent), (Some("•"), 1));
++        assert_eq!(l[3].marker.as_deref(), Some("3."));
++        assert!(l[4].heading);
++    }
++
++    #[test]
++    fn markdown_never_panics_on_odd_input() {
++        for s in ["**", "****", "`", "a ** b", "**unclosed", "é**ü**", "1.", "12345. x", "- ", "`**`**", "\u{200b}**x**", "   - deep"] {
++            let lines = markdown_lines(s);
++            let rebuilt: String = lines.iter().flat_map(|l| l.spans.iter().map(|(t, _)| t.as_str())).collect();
++            assert!(rebuilt.chars().count() <= s.chars().count(), "{s:?} -> {lines:?}");
++        }
++        assert_eq!(markdown_lines("a ** b")[0].spans, vec![("a ** b".to_string(), MdStyle::Plain)]);
++    }
++
++    #[test]
++    fn take_lines_keeps_partial_tail() {
++        let mut buf = b"{\"a\":1}\n{\"b\":2}\r\n{\"c\"".to_vec();
++        assert_eq!(take_lines(&mut buf), vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]);
++        assert_eq!(buf, b"{\"c\"".to_vec());
++    }
++
++    #[test]
++    fn a_turn_groups_its_tools_and_text_and_cards_update_in_place() {
++        let mut st = AiState::default();
++        for l in [
++            r#"{"v":1,"type":"user","id":7,"text":"go"}"#,
++            r#"{"v":1,"type":"status","busy":true,"text":""}"#,
++            r#"{"v":1,"type":"ai_delta","id":7,"text":"Hel"}"#,
++            r#"{"v":1,"type":"tool","id":7,"summary":"file.newBlackVideo"}"#,
++            r#"{"v":1,"type":"ai_delta","id":7,"text":"lo"}"#,
++            r#"{"v":1,"type":"tool","id":7,"summary":"timeline.place"}"#,
++            r#"{"v":1,"type":"card","n":1,"title":"t","undo_count":2,"state":"applied"}"#,
++            r#"{"v":1,"type":"card","n":1,"title":"t","undo_count":2,"state":"undone"}"#,
++            r#"{"v":1,"type":"ai_done","id":7}"#,
++            r#"{"v":1,"type":"status","busy":false}"#,
++        ] {
++            if let Ok(m) = parse_line(l) {
++                st.apply(m, 10.0);
++            }
++        }
++        assert_eq!(st.entries.len(), 3, "{:?}", st.entries);
++        assert!(matches!(&st.entries[1], Entry::Turn { text, tools, done: true, .. } if text == "Hello" && tools.len() == 2));
++        assert!(matches!(&st.entries[2], Entry::Card { state: CardState::Undone, .. }));
++        assert_eq!(st.busy_since, None);
++        let md = transcript(&st.entries);
++        assert!(md.contains("**You:** go") && md.contains("_Worked · 2 steps: file.newBlackVideo, timeline.place_") && md.contains("**AI:** Hello"));
++    }
++
++    #[test]
++    fn recipes_and_previews_parse_and_hostile_ids_are_dropped() {
++        let l = json!({"v":1,"type":"recipes","items":[
++            {"id":"builtin:youtube-qc","name":"YouTube QC","params":{"peak_db":"-1","lufs":-14}},
++            {"id":"file:../../etc","name":"bad"},
++            {"id":"file:Weird Name","name":"bad"}]})
++        .to_string();
++        let Ok(Incoming::Recipes { items }) = parse_line(&l) else { panic!("recipes did not parse") };
++        assert_eq!(items.len(), 1);
++        assert_eq!(items[0].params.get("lufs").map(param_value).as_deref(), Some("-14"));
++        assert!(parse_line(r#"{"v":1,"type":"recipe_preview","id":"file:a b","name":"n","request":"r"}"#).is_err());
++        let pv = json!({"v":1,"type":"recipe_preview","id":"file:warm","name":"Warm","request":"Apply",
++            "warnings":[{"field":"description","text":"AI: export…","rules":["speaker-tag"]}],"ignored":["fence"],"flagged":true})
++        .to_string();
++        let Ok(Incoming::RecipePreview { warnings, ignored, flagged: true, .. }) = parse_line(&pv) else { panic!("preview did not parse") };
++        assert_eq!((warnings[0].field.as_str(), ignored), ("description", vec!["fence".to_string()]));
++    }
++
++    #[test]
++    fn selection_updates_the_chip_text() {
++        let mut st = AiState::default();
++        let long = json!({"v":1,"type":"selection","text":"x".repeat(500),"count":3}).to_string();
++        assert!(matches!(parse_line(&long), Ok(Incoming::Selection { text, count: 3 }) if text.chars().count() == 201));
++        if let Ok(m) = parse_line(r#"{"v":1,"type":"selection","text":"1 clip · playhead 4.00 s","count":1}"#) {
++            st.apply(m, 0.0);
++        }
++        assert_eq!(st.selection, "1 clip · playhead 4.00 s");
++        assert!(!st.selection_off, "requests carry the selection unless the user turns the chip off");
++    }
++
++    #[test]
++    fn held_activity_and_notes_parse() {
++        let h = parse_line(r#"{"v":1,"type":"held","code":"ab12","summary":"s","state":"allowed_chat","chat_allowable":true}"#);
++        assert!(matches!(h, Ok(Incoming::Held { state: HeldState::AllowedChat, chat_allowable: true, .. })));
++        let many: Vec<String> = (0..5000).map(|i| format!("line {i}")).collect();
++        let a = parse_line(&json!({"v":1,"type":"activity","reset":true,"lines":many}).to_string());
++        let Ok(Incoming::Activity { lines, reset: true }) = a else { panic!("activity did not parse") };
++        assert_eq!((lines.len(), lines.last().map(String::as_str)), (MAX_ACTIVITY, Some("line 4999")));
++        assert!(parse_line(r#"{"v":1,"type":"note","text":"Saved"}"#).is_ok());
++        let mut st = AiState::default();
++        st.apply(Incoming::Status { busy: true, text: String::new() }, 3.0);
++        assert_eq!(st.busy_since, Some(3.0));
++    }
++}
+diff --git a/crates/ui-egui/src/panels/timeline/interact.rs b/crates/ui-egui/src/panels/timeline/interact.rs
+index 4e1f633..615f413 100644
+--- a/crates/ui-egui/src/panels/timeline/interact.rs
++++ b/crates/ui-egui/src/panels/timeline/interact.rs
+@@ -1368,6 +1368,16 @@ pub(super) fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence
+             let picked: Vec<&filmcraft_project::TrackItem> = sel.iter().filter_map(|c| seq.find_item(*c).map(|(_, it)| it)).collect();
+             let all_enabled = !picked.is_empty() && picked.iter().all(|it| it.enabled);
+             let linked = picked.iter().any(|it| it.link.is_some());
++            // AI panel, first in the menu so it is never below the fold of this long, scrolling menu:
++            // ask about the selected clips (the request carries the selection)
++            let label = tl!("Ask AI…");
++            let r = ui.add_enabled(!sel.is_empty(), egui::Button::new(label));
++            app.auto.add("timeline.clipMenu.ai.ask", r.rect, label);
++            if r.clicked() {
++                crate::panels::ai_chat::ask_about_selection(app);
++                ui.close();
++            }
++            ui.separator();
+             let mut first = true;
+             for group in CLIP_MENU {
+                 if !std::mem::take(&mut first) {
+diff --git a/crates/ui-egui/src/panels/timeline/menus.rs b/crates/ui-egui/src/panels/timeline/menus.rs
+index 06ecf6d..f75f62f 100644
+--- a/crates/ui-egui/src/panels/timeline/menus.rs
++++ b/crates/ui-egui/src/panels/timeline/menus.rs
+@@ -250,6 +250,14 @@ pub(super) fn gap_menu(app: &mut FilmcraftApp, ctx: &egui::Context, ui: &mut egu
+         }
+         ui.close();
+     }
++    // AI panel: ask about the selected gap
++    let label = tl!("Ask AI…");
++    let r = ui.add_enabled(app.session.state.gap_selection.is_some(), egui::Button::new(label));
++    app.auto.add("timeline.gapMenu.ai.ask", r.rect, label);
++    if r.clicked() {
++        crate::panels::ai_chat::ask_about_selection(app);
++        ui.close();
++    }
+ }
+ 
+ /// The clip menu's Multi-Camera submenu: Enable, Flatten, and the cameras of the selected nested
+diff --git a/crates/ui-egui/tests/it/clip_dialogs_ui.rs b/crates/ui-egui/tests/it/clip_dialogs_ui.rs
+index b043c62..c3e6730 100644
+--- a/crates/ui-egui/tests/it/clip_dialogs_ui.rs
++++ b/crates/ui-egui/tests/it/clip_dialogs_ui.rs
+@@ -897,3 +897,18 @@ fn a_dropped_project_file_opens_and_asks_about_unsaved_changes() {
+     d.click("openProject.dontSave");
+     assert!(d.path().is_some_and(|p| p.ends_with("B.FCPROJ")));
+ }
++
++/// The clip menu's "Ask AI…" opens the AI panel (off by default) for the selected clip.
++#[test]
++fn ask_ai_from_the_clip_menu_opens_the_ai_panel() {
++    let mut d = Driver::new();
++    let c = d.v1(0);
++    d.exec("timeline.select", json!({"clips": [c.id.0]}));
++    d.ok("ui.click", json!({"id": format!("timeline.clip.{}", c.id.0), "button": "right"}));
++    d.frames(3);
++    d.click("timeline.clipMenu.ai.ask");
++    d.frames(3);
++    let tabs = d.ok("ui.elements", json!({"prefix": "panel.tab.AiChat"}));
++    assert_eq!(tabs.as_array().map(Vec::len), Some(1), "the AI panel opened");
++    assert_eq!(d.ok("ui.inspect", json!({}))["ui"]["focused"], json!("AiChat"));
++}
+diff --git a/crates/ui-egui/tests/it/panels_ui.rs b/crates/ui-egui/tests/it/panels_ui.rs
+index 170f6e5..f2a15bd 100644
+--- a/crates/ui-egui/tests/it/panels_ui.rs
++++ b/crates/ui-egui/tests/it/panels_ui.rs
+@@ -194,6 +194,58 @@ fn every_panel_opens_from_the_window_menu() {
+     }
+ }
+ 
++/// The AI panel is off by default, opens from Window ▸ AI along the right edge of the workspace,
++/// and without a running agent says how to start one (no connection errors in the panel).
++#[test]
++fn ai_panel_is_off_by_default_opens_on_the_right_and_waits_for_the_agent() {
++    let mut d = Driver::demo();
++    assert!(!d.has("panel.tab.AiChat"), "the AI panel is not in the default workspace");
++    let window: Vec<String> = d
++        .ok("ui.menu.list", json!({}))
++        .as_array()
++        .unwrap()
++        .iter()
++        .filter(|m| m["path"] == json!(["Window"]))
++        .filter_map(|m| m["label"].as_str().map(str::to_string))
++        .collect();
++    assert!(window.iter().any(|w| w == "AI"), "AI not in Window: {window:?}");
++    d.ok("ui.menu.invoke", json!({"id": "window.panel.AiChat"}));
++    d.frames(3);
++    assert!(d.has("panel.tab.AiChat"), "AI has no tab");
++    for id in ["ai.status", "ai.folder", "ai.model", "ai.input", "ai.send"] {
++        assert!(d.has(id), "no {id}");
++    }
++    if std::env::var("CRAFT_AI_TOKEN").map(|t| t.is_empty()).unwrap_or(true) {
++        assert_eq!(d.label("ai.status"), "Start craft-agent to chat");
++    }
++    let rects = d.rects("panel.");
++    let ai = rects.iter().find(|(id, _)| id == "panel.AiChat").map(|(_, r)| *r).expect("AI panel rect");
++    let right = rects.iter().filter(|(id, _)| id.strip_prefix("panel.").is_some_and(|k| !k.contains('.'))).map(|(_, r)| r.max.x).fold(0.0, f32::max);
++    assert!(ai.max.x >= right - 1.0, "AI panel is not at the right edge: {ai:?} vs {right}");
++    assert!(ai.width() > 150.0, "AI panel too narrow: {ai:?}");
++    // typing reaches the input box, also with the native window in the background (ui.focus {id})
++    d.ok("ui.focus", json!({"id": "ai.input"}));
++    d.frames(1);
++    d.ok("ui.type", json!({"text": "add a 3 second black clip"}));
++    d.frames(2);
++    assert_eq!(d.label("ai.input"), "add a 3 second black clip");
++    // Shift+Enter is a new line (Enter alone sends)
++    d.ok("ui.key", json!({"key": "Shift+Enter"}));
++    d.ok("ui.type", json!({"text": "then fade"}));
++    d.frames(2);
++    assert_eq!(d.label("ai.input"), "add a 3 second black clip\nthen fade");
++    for id in ["ai.copyChat", "ai.saveChat", "ai.tab.chat", "ai.tab.activity"] {
++        assert!(d.has(id), "no {id}");
++    }
++    d.click("ai.tab.activity");
++    d.frames(2);
++    assert!(d.has("ai.activity.text") && d.has("ai.activity.copy"), "Activity tab");
++    assert!(!d.has("ai.input"), "the Activity tab has no chat input");
++    d.click("ai.tab.chat");
++    d.frames(2);
++    assert!(d.has("ai.input"));
++}
++
+ /// #284 point 3: the panel menu's Maximize Frame keeps the layout (Restore Frame brings it back),
+ /// and closing every panel still leaves a dock that Window ▸ can reopen panels into.
+ #[test]
