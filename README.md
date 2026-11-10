@@ -139,7 +139,10 @@ Please read this before you rely on it.
 
 - **It is not a sandbox.** It only sees what goes through the FilmCraft MCP server. If you add the
   proxy to an MCP client that also lets the AI run shell commands or edit files, those actions don't
-  pass through the Guard. (Panel mode only allows the FilmCraft tools.)
+  pass through the Guard. In panel mode the helper starts Claude Code with every built-in tool switched off (`--tools ""`, plus a deny list and
+  `--strict-mcp-config`), so the AI there has only the guarded FilmCraft tools: it cannot run shell commands, list
+  processes or read other folders. Live check: "What files are in my Documents folder?" and "Which processes are running?"
+  are both refused.
 - **The scan matches patterns.** Reworded, translated, misspelled or cleverly encoded instructions
   can get past it, and harmless text can trip it. It does not read text inside images, video frames
   or audio.

@@ -29,6 +29,13 @@ MODELS = ("sonnet", "opus", "haiku")
 
 
 # ---------------------------------------------------------------- brains
+# Every Claude Code built-in that can run commands, touch files, reach the network or spawn helpers.
+BUILTIN_TOOLS = ("Bash", "BashOutput", "KillShell", "PowerShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
+                 "Glob", "Grep", "LS", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite", "Skill", "SlashCommand",
+                 "ExitPlanMode", "EnterPlanMode", "Monitor", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList",
+                 "RemoteTrigger", "EnterWorktree", "ExitWorktree", "ListMcpResourcesTool",
+                 "ReadMcpResourceTool")
+
 class ClaudeCodeBrain:
     """One persistent conversation driven through `claude -p --resume`."""
 
@@ -53,7 +60,10 @@ class ClaudeCodeBrain:
     def argv(self, text: str) -> list[str]:
         a = [self.claude, "-p", text, "--output-format", "stream-json", "--verbose", "--include-partial-messages",
              "--mcp-config", str(self.mcp_config), "--strict-mcp-config",
-             "--allowedTools", f"mcp__{self.server}", "--model", self.model]
+             "--tools", "",  # no built-in tools at all: the model gets ONLY the guarded app tools
+             "--disallowedTools", *BUILTIN_TOOLS,  # belt and braces if a future version ignores --tools
+             "--allowedTools", f"mcp__{self.server}",
+             "--permission-mode", "dontAsk", "--disable-slash-commands", "--model", self.model]
         if self.session:
             a += ["--resume", self.session]
         return a

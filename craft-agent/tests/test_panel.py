@@ -363,6 +363,13 @@ class ClaudeArgvTest(unittest.TestCase):
         a = b.argv("hi")
         self.assertNotIn("--resume", a)
         self.assertEqual(a[a.index("--allowedTools") + 1], "mcp__craft-filmcraft")
+        # security: no built-in tool of Claude Code reaches the model, only the guarded app tools
+        self.assertEqual(a[a.index("--tools") + 1], "")
+        denied = a[a.index("--disallowedTools") + 1:a.index("--allowedTools")]
+        for t in ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "Task", "NotebookEdit", "TodoWrite"):
+            self.assertIn(t, denied)
+        self.assertIn("--strict-mcp-config", a)
+        self.assertEqual(a[a.index("--permission-mode") + 1], "dontAsk")
         self.assertIn("--strict-mcp-config", a)
         b.session = "abc"
         self.assertEqual(b.argv("again")[-2:], ["--resume", "abc"])
